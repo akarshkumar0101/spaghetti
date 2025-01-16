@@ -1,3 +1,4 @@
+import jax
 import jax.numpy as jnp
 from einops import rearrange
 from transformers import AutoProcessor, FlaxCLIPModel
