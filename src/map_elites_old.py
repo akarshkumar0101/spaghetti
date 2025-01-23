@@ -91,7 +91,7 @@ def main(args):
         return archive, data
 
     @jax.jit
-    def do_iter(archive, rng):
+    def do_iter(rng, archive):
         p = (archive['quality'] > -jnp.inf).astype(jnp.float32)
         p = p / p.sum()
         rng, _rng = split(rng)
@@ -102,7 +102,7 @@ def main(args):
         phenos_children = jax.vmap(get_pheno)(params_children)
         archive, data = jax.lax.scan(place_in_archive, archive, phenos_children)
 
-        data = jax.tree.map(lambda x: x.sum(axis=0), data)
+        data = jax.tree.map(lambda x: x.sum(), data)
         data['nid_parent'] = idx_parents
         quality = archive['quality'] * jnp.isfinite(archive['quality'])
         data['percent_archive_filled'] = (quality > 0).mean()
@@ -119,20 +119,23 @@ def main(args):
     print('archive shape: ', jax.tree.map(lambda x: x.shape, archive))
 
     data = []
-    args.n_iters = args.n_iters//100
     pbar = tqdm(range(args.n_iters))
     for i_iter in pbar:
         rng, _rng = split(rng)
-        archive, di = jax.lax.scan(do_iter, archive, split(_rng, 100))
+        archive, di = do_iter(rng, archive)
+        # del di['pheno']
         data.append(di)
 
-        if i_iter % (10) == 0:
-            pbar.set_postfix(n_transfers=di['n_transfers'].mean().item(), avg_quality=di['avg_quality'].mean().item())
+        if i_iter % (10000) == 0:
+            pbar.set_postfix(n_transfers=di['n_transfers'].item(), avg_quality=di['avg_quality'].item(), 
+                             percent_archive_filled=di['percent_archive_filled'].item())
 
-        if args.save_dir and (i_iter % (args.n_iters//5) == 0 or i_iter == args.n_iters-1):
+        if args.save_dir and (i_iter % (args.n_iters//20) == 0 or i_iter == args.n_iters-1):
             util.save_pkl(args.save_dir, 'archive', jax.tree.map(lambda x: np.array(x), archive))
-            util.save_pkl(args.save_dir, 'data', jax.tree.map(lambda *x: np.array(jnp.concatenate(x, axis=0)), *data))
+            util.save_pkl(args.save_dir, 'data', jax.tree.map(lambda *x: np.array(jnp.stack(x, axis=0)), *data))
 
 if __name__ == '__main__':
     main(parse_args())
+
+
 
