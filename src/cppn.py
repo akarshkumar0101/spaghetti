@@ -37,10 +37,28 @@ class CPPN(nn.Module):
         else:
             return rgb
 
+def hsv2rgb(hsv):
+    h, s, v = hsv
+    h = h * 360.
+
+    c = v * s
+    x = c * (1 - jnp.abs((h / 60) % 2 - 1))
+    m = v - c
+    rgbp1, c1 = jnp.stack([c, x, 0], axis=-1), (0 <= h)*(h<60)
+    rgbp2, c2 = jnp.stack([x, c, 0], axis=-1), (60 <= h)*(h<120)
+    rgbp3, c3 = jnp.stack([0, c, x], axis=-1), (120 <= h)*(h<180)
+    rgbp4, c4 = jnp.stack([0, x, c], axis=-1), (180 <= h)*(h<240)
+    rgbp5, c5 = jnp.stack([x, 0, c], axis=-1), (240 <= h)*(h<300)
+    rgbp6, c6 = jnp.stack([c, 0, x], axis=-1), (300 <= h)*(h<360)
+    rgbp = rgbp1 * c1 + rgbp2 * c2 + rgbp3 * c3 + rgbp4 * c4 + rgbp5 * c5 + rgbp6 * c6
+    rgb = rgbp + m
+    return rgb.clip(0., 1.)
+
 class CPPN(nn.Module):
     n_layers: int
     d_hidden: int
     nonlin: str = 'tanh' # use tanh or relu
+    hsv: bool = False
 
     @nn.compact
     def __call__(self, x):
@@ -60,6 +78,9 @@ class CPPN(nn.Module):
         d = jnp.sqrt(x**2 + y**2)
         xyd = jnp.stack([x, y, d], axis=-1)
         rgb, features = jax.vmap(jax.vmap(partial(self.apply, params)))(xyd)
+
+        if self.hsv:
+            rgb = jax.vmap(jax.vmap(hsv2rgb))(rgb)
         if intermediate_features:
             return rgb, features
         else:

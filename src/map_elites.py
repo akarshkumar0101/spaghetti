@@ -51,7 +51,7 @@ def main(args):
     clip = CLIP()
     z_txt = clip.embed_txt(nouns)
 
-    cppn = CPPN(n_layers=4, d_hidden=16, nonlin='tanh')
+    cppn = CPPN(n_layers=4, d_hidden=16, nonlin='tanh', hsv=True)
     cppn = FlattenCPPNParameters(cppn)
 
     rng = jax.random.PRNGKey(args.seed)
@@ -109,11 +109,18 @@ def main(args):
         data['avg_quality'] = quality.sum()/(quality>0).sum()
         return archive, data
 
-    pheno = get_pheno(jax.random.normal(rng, (cppn.n_params, )))
+    params_init = jax.random.normal(rng, (args.pop_size, cppn.n_params, ))
+    scan_fn = lambda _, p: (None, get_pheno(p))
+    _, phenos_init = jax.lax.scan(scan_fn, None, params_init)
+    quality_init = (phenos_init['z_img'] * z_txt).sum(axis=-1)
+
+    # pheno = get_pheno(jax.random.normal(rng, (cppn.n_params, )))
     archive = dict(
         z_txt=z_txt,
-        pheno=jax.tree.map(lambda x: einop(x, "... -> N ...", N=args.pop_size), pheno),
-        quality=jnp.full((args.pop_size,), -jnp.inf),
+        # pheno=jax.tree.map(lambda x: einop(x, "... -> N ...", N=args.pop_size), pheno),
+        # quality=jnp.full((args.pop_size,), -jnp.inf),
+        pheno=phenos_init,
+        quality=quality_init,
     )
     archive, di = place_in_archive(archive, pheno)
     print('archive shape: ', jax.tree.map(lambda x: x.shape, archive))
