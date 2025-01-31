@@ -22,12 +22,12 @@ group.add_argument("--seed", type=int, default=0, help="the random seed")
 group.add_argument("--noun_file", type=str, default=None, help="path of noun file")
 group.add_argument("--save_dir", type=str, default=None, help="path to save results to")
 group.add_argument("--prompt", type=str, default="an image of a {}", help="prompt for CLIP")
-group.add_argument("--replace_only_one_niche", type=lambda x: x=='True', default=False, help="replace only the primary niche")
+# group.add_argument("--replace_only_one_niche", type=lambda x: x=='True', default=False, help="replace only the primary niche")
 
 group = parser.add_argument_group("optimization")
 group.add_argument("--n_iters", type=int, default=1000000, help="")
 group.add_argument("--pop_size", type=int, default=None, help="")
-group.add_argument("--n_mutations", type=int, default=1, help="number of mutations to do")
+group.add_argument("--n_mutations", type=int, default=16, help="number of mutations to do")
 group.add_argument("--mutation", type=str, default="gaussian", help="type of mutation to do")
 group.add_argument("--sigma", type=float, default=0.5, help="mutation strength")
 
@@ -78,10 +78,10 @@ def main(args):
         scores = z_img@archive['z_txt'].T # (N, )
         replace = scores > archive['quality'] # (N, )
 
-        if args.replace_only_one_niche:
-            nid = jnp.argmax(scores)
-            replace_single = jax.nn.one_hot(nid, args.pop_size, dtype=jnp.bool_)
-            replace = replace & replace_single
+        # if args.replace_only_one_niche:
+        #     nid = jnp.argmax(scores)
+        #     replace_single = jax.nn.one_hot(nid, args.pop_size, dtype=jnp.bool_)
+        #     replace = replace & replace_single
 
         pheno = jax.tree.map(lambda x: einop(x, "... -> 1 ..."), pheno)
         replace_fn = lambda x, y: jnp.where(replace.reshape((args.pop_size, )+(1,)*(x.ndim-1)), x, y)
@@ -103,13 +103,17 @@ def main(args):
         archive, data = jax.lax.scan(place_in_archive, archive, phenos_children)
 
         data = jax.tree.map(lambda x: x.sum(axis=0), data)
-        data['nid_parent'] = idx_parents
-        quality = archive['quality'] * jnp.isfinite(archive['quality'])
-        data['percent_archive_filled'] = (quality > 0).mean()
-        data['avg_quality'] = quality.sum()/(quality>0).sum()
+        # data['nid_parent'] = idx_parents
+        # quality = archive['quality'] * jnp.isfinite(archive['quality'])
+        # data['percent_archive_filled'] = (quality > 0).mean()
+        # data['avg_quality'] = quality.sum()/(quality>0).sum()
+        data['avg_quality'] = archive['quality'].mean()
         return archive, data
 
-    params_init = jax.random.normal(rng, (args.pop_size, cppn.n_params, ))
+
+    params_init = jnp.zeros((cppn.n_params, ))
+    params_init = jax.vmap(mutate_fn, in_axes=(0, None))(split(rng, args.pop_size), params_init)
+    # params_init = jax.random.normal(rng, (args.pop_size, cppn.n_params, ))
     scan_fn = lambda _, p: (None, get_pheno(p))
     _, phenos_init = jax.lax.scan(scan_fn, None, params_init)
     quality_init = (phenos_init['z_img'] * z_txt).sum(axis=-1)
