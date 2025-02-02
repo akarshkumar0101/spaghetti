@@ -51,6 +51,7 @@ def main(args):
     clip = CLIP()
     z_txt = clip.embed_txt(nouns)
 
+    # cppn = CPPN(n_layers=8, d_hidden=8, nonlin='tanh', hsv=True)
     cppn = CPPN(n_layers=4, d_hidden=16, nonlin='tanh', hsv=True)
     cppn = FlattenCPPNParameters(cppn)
 
@@ -113,7 +114,6 @@ def main(args):
 
     params_init = jnp.zeros((cppn.n_params, ))
     params_init = jax.vmap(mutate_fn, in_axes=(0, None))(split(rng, args.pop_size), params_init)
-    # params_init = jax.random.normal(rng, (args.pop_size, cppn.n_params, ))
     scan_fn = lambda _, p: (None, get_pheno(p))
     _, phenos_init = jax.lax.scan(scan_fn, None, params_init)
     quality_init = (phenos_init['z_img'] * z_txt).sum(axis=-1)
@@ -126,7 +126,6 @@ def main(args):
         pheno=phenos_init,
         quality=quality_init,
     )
-    archive, di = place_in_archive(archive, pheno)
     print('archive shape: ', jax.tree.map(lambda x: x.shape, archive))
 
     data = []
