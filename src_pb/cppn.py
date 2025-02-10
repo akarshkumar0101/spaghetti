@@ -23,17 +23,17 @@ activation_fn_map = dict(identity=identity, cos=cos, sin=sin, tanh=tanh, sigmoid
 
 class CPPN(nn.Module):
     n_layers: int
-    d_hidden: int
-    nonlins: str = "relu" # "sin,tanh,sigmoid,gaussian,relu"
-
-    inputs: str = "x,y,d" # "x,y,d,xabs,yabs"
+    # d_hidden: int
+    # nonlins: str = "relu" # "sin,tanh,sigmoid,gaussian,relu"
+    inputs: str = "x,y,d,b" # "x,y,d,b,xabs,yabs"
+    activation_neurons: str = "identity:20,identity:4,sin:1,cos:0,gaussian:4,sigmoid:0"
 
     @nn.compact
     def __call__(self, x):
         nonlins = self.nonlins.split(",")
         features = [x]
         for i_layer in range(self.n_layers):
-            x = nn.Dense(self.d_hidden)(x)
+            x = nn.Dense(self.d_hidden, use_bias=False)(x)
 
             x = rearrange(x, "(n k) -> n k", n=len(nonlins))
             x = [activation_fn_map[nonlins[i]](x[i]) for i in range(len(nonlins))]
@@ -41,7 +41,7 @@ class CPPN(nn.Module):
             # x = jax.nn.relu(x)
 
             features.append(x)
-        x = nn.Dense(3)(x)
+        x = nn.Dense(3, use_bias=False)(x)
         features.append(x)
         h, s, v = jax.nn.tanh(x) # CHANGED THIS TO TANH
         return (h, s, v), features
@@ -51,6 +51,7 @@ class CPPN(nn.Module):
         x = y = jnp.linspace(-1, 1, img_size)
         inputs['x'], inputs['y'] = jnp.meshgrid(x, y, indexing='ij')
         inputs['d'] = jnp.sqrt(inputs['x']**2 + inputs['y']**2) * 1.4
+        inputs['b'] = jnp.ones_like(inputs['x'])
         inputs['xabs'], inputs['yabs'] = jnp.abs(inputs['x']), jnp.abs(inputs['y'])
         inputs = [inputs[input_name] for input_name in self.inputs.split(",")]
         inputs = jnp.stack(inputs, axis=-1)

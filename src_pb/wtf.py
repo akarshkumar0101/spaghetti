@@ -1,0 +1,389 @@
+import os
+import argparse
+from functools import partial
+
+import numpy as np
+import jax
+import jax.numpy as jnp
+from jax.random import split
+
+import flax
+import flax.linen as nn
+from einops import rearrange
+import evosax
+
+import xml.etree.ElementTree as ET
+import zipfile
+
+from color import hsv2rgb
+import util
+
+def viz_feature_maps(features):
+    max_features_per_layer = max(jax.tree.map(lambda x: x.shape[-1], features))
+    n_layers = len(features)
+    n_layers, max_features_per_layer
+
+    plt.figure(figsize=(1*max_features_per_layer, 1*n_layers))
+    for i, layer_features in enumerate(features):
+        for j, fmap in enumerate(rearrange(layer_features, 'h w c -> c h w')):
+            plt.subplot(n_layers, max_features_per_layer, i*max_features_per_layer + j + 1)
+            plt.imshow(fmap, cmap='bwr_r', vmin=-1.0, vmax=1.0); plt.xticks([]); plt.yticks([])
+            if j==0:
+                plt.ylabel(f"{i}", fontsize=25)
+            for spine in plt.gca().spines.values():
+                spine.set_edgecolor('black')
+                spine.set_linewidth(1)
+    # plt.subplot(n_layers, max_features_per_layer, (n_layers-1)*max_features_per_layer + (max_features_per_layer-1) + 1)
+    # plt.imshow(rgb); plt.axis('off')
+    plt.gcf().supylabel("Layer", fontsize=35)
+    plt.gcf().supxlabel("Feature Map", fontsize=35)
+    plt.suptitle("Feature Maps of CPPN", fontsize=35)
+    plt.tight_layout()
+    return plt.gcf()
+
+class CPPN(nn.Module):
+    n_layers: int
+    # d_hidden: int
+    # nonlins: str = "relu" # "sin,tanh,sigmoid,gaussian,relu"
+    activation_neurons: str = "relu:20"
+    inputs: str = "y,x,d,b" # "x,y,d,b,xabs,yabs"
+
+    @nn.compact
+    def __call__(self, x):
+        activations = [i.split(":")[0] for i in self.activation_neurons.split(",")]
+        d_hidden = jnp.array([int(i.split(":")[-1]) for i in self.activation_neurons.split(",")])
+
+        features = [x]
+        for i_layer in range(self.n_layers):
+            x = nn.Dense(sum(d_hidden), use_bias=False)(x)
+
+            x = jnp.split(x, jnp.cumsum(d_hidden))
+            x = [activation_fn_map[activation](xi) for xi, activation in zip(x, activations)]
+            x = jnp.concatenate(x)
+
+            features.append(x)
+        x = nn.Dense(3, use_bias=False)(x)
+        features.append(x)
+        # h, s, v = jax.nn.tanh(x) # CHANGED THIS TO TANH
+        h, s, v = x
+        return (h, s, v), features
+
+    def generate_image(self, params, img_size=256, return_features=False):
+        inputs = {}
+        x = y = jnp.linspace(-1, 1, img_size)
+        inputs['x'], inputs['y'] = jnp.meshgrid(x, y, indexing='ij')
+        inputs['d'] = jnp.sqrt(inputs['x']**2 + inputs['y']**2) * 1.4
+        inputs['b'] = jnp.ones_like(inputs['x'])
+        inputs['xabs'], inputs['yabs'] = jnp.abs(inputs['x']), jnp.abs(inputs['y'])
+        inputs = [inputs[input_name] for input_name in self.inputs.split(",")]
+        inputs = jnp.stack(inputs, axis=-1)
+        (h, s, v), features = jax.vmap(jax.vmap(partial(self.apply, params)))(inputs)
+        r, g, b = hsv2rgb((h+1)%1, s.clip(0,1), jnp.abs(v).clip(0, 1))
+        rgb = jnp.stack([r, g, b], axis=-1)
+        if return_features:
+            return rgb, features
+        else:
+            return rgb
+
+class FlattenCPPNParameters():
+    def __init__(self, cppn):
+        self.cppn = cppn
+
+        rng = jax.random.PRNGKey(0)
+        d_in = len(self.cppn.inputs.split(","))
+        self.param_reshaper = evosax.ParameterReshaper(self.cppn.init(rng, jnp.zeros((d_in,))))
+        self.n_params = self.param_reshaper.total_params
+    
+    def init(self, rng):
+        d_in = len(self.cppn.inputs.split(","))
+        params = self.cppn.init(rng, jnp.zeros((d_in,)))
+        return self.param_reshaper.flatten_single(params)
+
+    def generate_image(self, params, img_size=256, return_features=False):
+        params = self.param_reshaper.reshape_single(params)
+        return self.cppn.generate_image(params, img_size=img_size, return_features=return_features)
+
+def xml_to_dict(element):
+    node = {}
+    if element.attrib:
+        node.update({f"@{key}": value for key, value in element.attrib.items()})
+    children = list(element)
+    if children:
+        child_dict = {}
+        for child in children:
+            child_name = child.tag
+            child_dict.setdefault(child_name, []).append(xml_to_dict(child))
+        for key, value in child_dict.items():
+            node[key] = value if len(value) > 1 else value[0]
+    else:
+        if element.text and element.text.strip():
+            node["#text"] = element.text.strip()
+    return node
+
+def load_pbcppn(zip_file_path):
+    with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
+        file_list = zip_ref.namelist()
+        assert len(file_list) == 1
+        for file_name in file_list:
+            with zip_ref.open(file_name) as file:
+                file_content = file.read().decode('utf-8')
+    root = xml_to_dict(ET.fromstring(file_content))
+    if 'genome' not in root:
+        root = dict(genome=root)
+    ns, ls = [], []
+    nodes_ = root['genome']['nodes']['node']
+    links_ = root['genome']['links']['link']
+    nodes, links = [], []
+    for node in nodes_:
+        # node = dict(type=node['@type'], label=node['@label'] if '@label' in node else "", id=int(node['marking']['@id']), activation=node['activation']['#text'][:-3])
+        node = dict(label=node['@label'] if '@label' in node else "", id=int(node['marking']['@id']), activation=node['activation']['#text'][:-3])
+        nodes.append(node)
+    for link in links_:
+        link = dict(id=int(link['marking']['@id']), source=int(link['source']['@id']), target=int(link['target']['@id']), weight=float(link['weight']['#text']))
+        links.append(link)
+
+    if 'ink' in [node['label'] for node in nodes]: # convert ink output to hsv standard
+        node_v = [node for node in nodes if node['label'] == 'ink'][0]
+        node_v['label'] = 'brightness'
+        nodes.append(dict(label='hue', id=1000000, activation='identity'))
+        nodes.append(dict(label='saturation', id=1000001, activation='identity'))
+        links.append(dict(id=1000002, source=node_v['id'], target=1000000, weight=0.))
+        links.append(dict(id=1000003, source=node_v['id'], target=1000001, weight=0.))
+
+    special_nodes = {}
+    special_nodes['x'] = [node['id'] for node in nodes if node['label'] == 'x'][0]
+    special_nodes['y'] = [node['id'] for node in nodes if node['label'] == 'y'][0]
+    special_nodes['d'] = [node['id'] for node in nodes if node['label'] == 'd'][0]
+    special_nodes['bias'] = [node['id'] for node in nodes if node['label'] == 'bias'][0]
+    special_nodes['h'] = [node['id'] for node in nodes if node['label'] == 'hue'][0]
+    special_nodes['s'] = [node['id'] for node in nodes if node['label'] == 'saturation'][0]
+    special_nodes['v'] = [node['id'] for node in nodes if node['label'] == 'brightness'][0]
+    # links = [link for link in links if link['weight'] != 0.]
+    return dict(nodes=nodes, links=links, special_nodes=special_nodes)
+
+cache = lambda x: x
+identity = lambda x: x
+cos = jnp.cos
+sin = jnp.sin
+tanh = jnp.tanh
+sigmoid = lambda x: jax.nn.sigmoid(x) * 2. - 1.
+gaussian = lambda x: jnp.exp(-x**2) * 2. - 1.
+relu = jax.nn.relu
+activation_fn_map = dict(cache=cache, identity=identity, cos=cos, sin=sin, tanh=tanh, sigmoid=sigmoid, gaussian=gaussian, relu=relu)
+
+def do_forward_pass(nn):
+    res = 256
+    x = y = jnp.linspace(-1., 1., res)
+    x, y = jnp.meshgrid(x, y)
+    d = jnp.sqrt(x**2 + y**2)*1.4
+    b = jnp.ones_like(x)
+
+    node2activation = {n['id']: n['activation'] for n in nn['nodes']}
+    node2out_links = {n['id']: [(l['target'], l['weight']) for l in nn['links'] if l['source'] == n['id']] for n in nn['nodes']}
+    node2in_links = {n['id']: [(l['source'], l['weight']) for l in nn['links'] if l['target'] == n['id']] for n in nn['nodes']}
+    node_x = nn['special_nodes']['x']
+    node_y = nn['special_nodes']['y']
+    node_d = nn['special_nodes']['d']
+    node_b = nn['special_nodes']['bias']
+    node_h = nn['special_nodes']['h']
+    node_s = nn['special_nodes']['s']
+    node_v = nn['special_nodes']['v']
+
+    node2val = {} #{node['id']: np.zeros_like(x) for node in nn['nodes']}
+    node2val[node_x], node2val[node_y], node2val[node_d], node2val[node_b] = x, y, d, b
+
+    def get_value_recur(node, path=[]):
+        if node in node2val:
+            return node2val[node]
+        if node in path:
+            print(f'CYCLE: {path}')
+            return jnp.zeros_like(x)
+        val = jnp.zeros_like(x)
+        for node_src, weight in node2in_links[node]:
+            val = val + weight * get_value_recur(node_src, path=path+[node])
+        node2val[node] = activation_fn_map[node2activation[node]](val)
+        return node2val[node]
+
+    for node in [node_h, node_s, node_v]: # actual forward pass
+        get_value_recur(node, path=[])
+    
+    h, s, v = node2val[node_h], node2val[node_s], node2val[node_v]
+    r, g, b = hsv2rgb((h+1)%1, s.clip(0,1), jnp.abs(v).clip(0, 1))
+    rgb = jnp.stack([r, g, b], axis=-1)
+    return dict(rgb=rgb, node2val=node2val)
+
+def layerize_nn(nn):
+    node2activation = {n['id']: n['activation'] for n in nn['nodes']}
+    node2out_links = {n['id']: [(l['target'], l['weight']) for l in nn['links'] if l['source'] == n['id']] for n in nn['nodes']}
+    node2in_links = {n['id']: [(l['source'], l['weight']) for l in nn['links'] if l['target'] == n['id']] for n in nn['nodes']}
+    node_x = nn['special_nodes']['x']
+    node_y = nn['special_nodes']['y']
+    node_d = nn['special_nodes']['d']
+    node_b = nn['special_nodes']['bias']
+    node_h = nn['special_nodes']['h']
+    node_s = nn['special_nodes']['s']
+    node_v = nn['special_nodes']['v']
+
+    outputs = do_forward_pass(nn)
+    rgb, node2val = outputs['rgb'], outputs['node2val']
+
+    node2layer = {node_x: 0, node_y: 0, node_d: 0, node_b: 0}
+    i_layer = 1
+    while True: # get the layer numbers of each node
+        nodes_in_layer = []
+        for node in node2val:
+            if node in node2layer:
+                continue
+            if all(src in node2layer for src, _ in node2in_links[node]):
+                nodes_in_layer.append(node)
+        for node in nodes_in_layer:
+            node2layer[node] = i_layer
+        i_layer += 1
+        if not nodes_in_layer:
+            break
+    
+    n_layers = max(node2layer.values()) + 1
+    nodes_cache = [[] for i in range(n_layers)] # what nodes are at each layer (layerized)
+    for node in node2val: # calculate the cache of each node
+        layer_start = node2layer[node]
+        if node in [node_h, node_s, node_v]:
+            layer_end = n_layers
+        elif len(node2out_links[node])>0:
+            layer_end = max([node2layer[target] for target, _ in node2out_links[node]])
+        for i in range(layer_start, layer_end):
+            nodes_cache[i].append((node, i==layer_start))
+    
+    nodes_cache[0] = [(node, False) for node, _ in nodes_cache[0]]
+    
+    from collections import defaultdict
+    arch = defaultdict(int)
+    for i_layer, nodes_layer in enumerate(nodes_cache):
+        a = defaultdict(int)
+        for node, novel in nodes_layer:
+            a[node2activation[node] if novel else "cache"] += 1
+        print(dict(a))
+        for k in a:
+            arch[k] = max(arch[k], a[k])
+    arch = dict(sorted(dict(arch).items()))
+    width = sum(arch.values())
+    print("n_nodes=", len(node2val))
+    print(arch)
+    print("n_layers=", n_layers)
+    print("width=", width)
+    print("parameters=", width*width*n_layers)
+    features = [jnp.stack([node2val[node] for node, _ in nodes_cache[i]], axis=-1) for i in range(n_layers)]
+    def get_novelty(node, nodes_cache_layer):
+        a = [novelty for n, novelty in nodes_cache_layer if n==node]
+        assert len(a) == 1
+        return a[0]
+    nodes_cache[0] = [(node, get_novelty(node, nodes_cache[0])) for node in [node_x, node_y, node_d, node_b]]
+    # nodes_cache[-1] = [(node, get_novelty(node, nodes_cache[-1])) for node in [node_h, node_s, node_v]]
+    nodes_cache.append([(n, False) for n in [node_h, node_s, node_v]])
+
+    arch = ','.join([f"{k}:{v}" for k, v in arch.items()])
+    outputs = dict(rgb=rgb, node2val=node2val, arch=arch, node2layer=node2layer, features=features, nodes_cache=nodes_cache)
+    # raise ValueError
+    return outputs
+
+def get_weight_matrix(net, i_layer, nodes_cache, activation_neurons=""):
+    node2activation = {n['id']: n['activation'] for n in net['nodes']}
+
+    activations = [i.split(":")[0] for i in activation_neurons.split(",")]
+    d_hidden = np.array([int(i.split(":")[-1]) for i in activation_neurons.split(",")])
+
+    position_offset = {act: p for act, p in zip(activations, np.cumsum(np.array([0]+list(d_hidden)[:-1])))}
+
+    def get_position_within_layer(nodes_caches_layer, node): # node_id
+        i_node = [n for n, _ in nodes_caches_layer].index(node)
+
+        node, act = nodes_caches_layer[i_node]
+        p = 0
+        for n, a in nodes_caches_layer:
+            if n==node:
+                break
+            elif a==act:
+                p+=1
+        p = p + position_offset[act]
+        return p
+
+    prev_layer = nodes_cache[i_layer]
+    this_layer = nodes_cache[i_layer+1]
+    prev_layer = [(a, 'cache' if not b else node2activation[a]) for a, b in prev_layer]
+    this_layer = [(a, 'cache' if not b else node2activation[a]) for a, b in this_layer]
+
+    if i_layer==0:
+        prev_layer = [(a, 'cache') for a, _ in prev_layer]
+
+    weight_mat = np.zeros((sum(d_hidden), sum(d_hidden)))
+    for n, act in this_layer:
+        p = get_position_within_layer(this_layer, n)
+        if act=='cache':
+            p2 = get_position_within_layer(prev_layer, n)
+            # print(n, act, p, p2)
+            weight_mat[p, p2] = 1.
+        else:
+            for src, w in [(l['source'], l['weight']) for l in net['links'] if l['target']==n]:
+                p2 = get_position_within_layer(prev_layer, src)
+                weight_mat[p, p2] = w
+    return weight_mat.T
+
+def construct_dense_cppn(pbcppn, nodes_cache, activation_neurons=""):
+    n_layers = len(nodes_cache)-1
+    cppn = CPPN(n_layers-1, activation_neurons)
+    cppn = FlattenCPPNParameters(cppn)
+    params = jnp.zeros(cppn.n_params)
+    params = cppn.param_reshaper.reshape_single(params)
+
+    weight_mats = np.stack([get_weight_matrix(pbcppn, i_layer, nodes_cache, activation_neurons=activation_neurons) for i_layer in range(n_layers)])
+
+    for i_layer in range(n_layers):
+        a, b = params['params'][f'Dense_{i_layer}']['kernel'].shape
+        w = weight_mats[i_layer][:a, :b]
+        params['params'][f'Dense_{i_layer}']['kernel'] = jnp.array(w)[:a, :b]
+
+    # a, b = params['params'][f'Dense_{n_layers-1}']['kernel'].shape
+    # params['params'][f'Dense_{n_layers-1}']['kernel'] = jnp.eye(a, b)
+
+    params = cppn.param_reshaper.flatten_single(params)
+    return cppn, params
+
+
+parser = argparse.ArgumentParser()
+group = parser.add_argument_group("meta")
+# group.add_argument("--seed", type=int, default=0, help="the random seed")
+
+group = parser.add_argument_group("data")
+group.add_argument("--pbid", type=int, default=576, help="picbreeder id for genome")
+group.add_argument("--save_dir", type=str, default=None, help="path to save results to")
+
+# group = parser.add_argument_group("data")
+# group.add_argument("--n_layers", type=int, default=10, help="number of layers")
+# group.add_argument("--d_hidden", type=int, default=25, help="number of hidden units")
+# group.add_argument("--nonlins", type=str, default="identity,sin,cos,gaussian,sigmoid", help="nonlinearity to use")
+
+# group = parser.add_argument_group("optimization")
+# group.add_argument("--n_iters", type=int, default=50000, help="number of iterations")
+# group.add_argument("--lr", type=float, default=3e-3, help="learning rate")
+
+def parse_args(*args, **kwargs):
+    args = parser.parse_args(*args, **kwargs)
+    for k, v in vars(args).items():
+        if isinstance(v, str) and v.lower() == "none":
+            setattr(args, k, None)  # set all "none" to None
+    return args
+
+def main(args):
+    pbcppn = load_pbcppn(f'/Users/akarshkumar0101/spaghetti_old/spaghetti/pbRender/genomeAll/{args.pbid}/rep.zip')
+    # outputs = do_forward_pass(pbcppn)
+    outputs = layerize_nn(pbcppn)
+    cppn, params = construct_dense_cppn(pbcppn, outputs['nodes_cache'], activation_neurons=outputs['arch'])
+    print(outputs['arch'])
+    img, features = cppn.generate_image(params, return_features=True, img_size=256)
+    if args.save_dir is not None:
+        os.makedirs(args.save_dir, exist_ok=True)
+        util.save_pkl(args.save_dir, "pbcppn", pbcppn)
+        util.save_pkl(args.save_dir, "outputs", outputs)
+        util.save_pkl(args.save_dir, "params", params)
+
+if __name__=="__main__":
+    main(parse_args())
