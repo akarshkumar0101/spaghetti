@@ -15,6 +15,8 @@ import evosax
 import xml.etree.ElementTree as ET
 import zipfile
 
+import matplotlib.pyplot as plt
+
 from color import hsv2rgb
 from cppn import CPPN, FlattenCPPNParameters, activation_fn_map
 import util
@@ -51,11 +53,16 @@ def load_pbcppn(zip_file_path):
     links_ = root['genome']['links']['link']
     nodes, links = [], []
     for node in nodes_:
-        # node = dict(type=node['@type'], label=node['@label'] if '@label' in node else "", id=int(node['marking']['@id']), activation=node['activation']['#text'][:-3])
-        node = dict(label=node['@label'] if '@label' in node else "", id=int(node['marking']['@id']), activation=node['activation']['#text'][:-3])
+        # node = dict(label=node['@label'] if '@label' in node else "", id=int(node['marking']['@id']), activation=node['activation']['#text'][:-3])
+        id_ = node['marking']['@branch']+"_"+node['marking']['@id']
+        node = dict(label=node['@label'] if '@label' in node else "", id=id_, activation=node['activation']['#text'][:-3])
         nodes.append(node)
     for link in links_:
-        link = dict(id=int(link['marking']['@id']), source=int(link['source']['@id']), target=int(link['target']['@id']), weight=float(link['weight']['#text']))
+        # link = dict(id=int(link['marking']['@id']), source=int(link['source']['@id']), target=int(link['target']['@id']), weight=float(link['weight']['#text']))
+
+        source_id = link['source']['@branch']+"_"+link['source']['@id']
+        target_id = link['target']['@branch']+"_"+link['target']['@id']
+        link = dict(id=int(link['marking']['@id']), source=source_id, target=target_id, weight=float(link['weight']['#text']))
         links.append(link)
 
     if 'ink' in [node['label'] for node in nodes]: # convert ink output to hsv standard
@@ -282,11 +289,13 @@ def main(args):
     pbcppn = load_pbcppn(f'/Users/akarshkumar0101/spaghetti_old/spaghetti/pbRender/genomeAll/{args.pbid}/rep.zip')
     # outputs = do_forward_pass(pbcppn)
     outputs = layerize_nn(pbcppn)
+    print(outputs.keys())
     cppn, params = construct_dense_cppn(pbcppn, outputs['nodes_cache'], activation_neurons=outputs['arch'])
     print(outputs['arch'])
     img, features = cppn.generate_image(params, return_features=True, img_size=256)
     if args.save_dir is not None:
         os.makedirs(args.save_dir, exist_ok=True)
+        plt.imsave(f"{args.save_dir}/img.png", outputs['rgb'])
         util.save_pkl(args.save_dir, "pbcppn", pbcppn)
         util.save_pkl(args.save_dir, "outputs", outputs)
         util.save_pkl(args.save_dir, "params", params)
