@@ -1,4 +1,6 @@
 from functools import partial
+import numpy as np
+
 import jax
 import jax.numpy as jnp
 from jax.random import split
@@ -92,13 +94,14 @@ class CPPN(nn.Module):
     @nn.compact
     def __call__(self, x):
         activations = [i.split(":")[0] for i in self.activation_neurons.split(",")]
-        d_hidden = jnp.array([int(i.split(":")[-1]) for i in self.activation_neurons.split(",")])
+        d_hidden = [int(i.split(":")[-1]) for i in self.activation_neurons.split(",")]
+        dh_cumsum = list(np.cumsum(d_hidden))
 
         features = [x]
         for i_layer in range(self.n_layers):
             x = nn.Dense(sum(d_hidden), use_bias=False)(x)
 
-            x = jnp.split(x, jnp.cumsum(d_hidden))
+            x = jnp.split(x, dh_cumsum)
             x = [activation_fn_map[activation](xi) for xi, activation in zip(x, activations)]
             x = jnp.concatenate(x)
 

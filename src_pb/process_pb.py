@@ -266,7 +266,7 @@ group = parser.add_argument_group("meta")
 # group.add_argument("--seed", type=int, default=0, help="the random seed")
 
 group = parser.add_argument_group("data")
-group.add_argument("--pbid", type=int, default=576, help="picbreeder id for genome")
+group.add_argument("--zip_path", type=str, default=None, help="path to rep.zip")
 group.add_argument("--save_dir", type=str, default=None, help="path to save results to")
 
 # group = parser.add_argument_group("data")
@@ -286,7 +286,7 @@ def parse_args(*args, **kwargs):
     return args
 
 def main(args):
-    pbcppn = load_pbcppn(f'/Users/akarshkumar0101/spaghetti_old/spaghetti/pbRender/genomeAll/{args.pbid}/rep.zip')
+    pbcppn = load_pbcppn(args.zip_path)
     # outputs = do_forward_pass(pbcppn)
     outputs = layerize_nn(pbcppn)
     print(outputs.keys())
@@ -295,10 +295,12 @@ def main(args):
     img, features = cppn.generate_image(params, return_features=True, img_size=256)
     if args.save_dir is not None:
         os.makedirs(args.save_dir, exist_ok=True)
-        plt.imsave(f"{args.save_dir}/img.png", outputs['rgb'])
+        plt.imsave(f"{args.save_dir}/img.png", np.array(outputs['rgb']))
         util.save_pkl(args.save_dir, "pbcppn", pbcppn)
         util.save_pkl(args.save_dir, "outputs", outputs)
         util.save_pkl(args.save_dir, "params", params)
+        cppn_args = (len(outputs['nodes_cache'])-2, outputs['arch'])
+        util.save_pkl(args.save_dir, "cppn_args", cppn_args)
 
 if __name__=="__main__":
     main(parse_args())

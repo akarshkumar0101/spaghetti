@@ -35,12 +35,11 @@ group.add_argument("--img_file", type=str, default="../skull.jpg", help="path of
 group.add_argument("--save_dir", type=str, default=None, help="path to save results to")
 
 group = parser.add_argument_group("data")
-group.add_argument("--n_layers", type=int, default=10, help="number of layers")
-group.add_argument("--d_hidden", type=int, default=25, help="number of hidden units")
-group.add_argument("--nonlins", type=str, default="identity,sin,cos,gaussian,sigmoid", help="nonlinearity to use")
+group.add_argument("--n_layers", type=int, default=12, help="number of layers")
+group.add_argument("--arch", type=str, default="", help="architecture")
 
 group = parser.add_argument_group("optimization")
-group.add_argument("--n_iters", type=int, default=50000, help="number of iterations")
+group.add_argument("--n_iters", type=int, default=100000, help="number of iterations")
 group.add_argument("--lr", type=float, default=3e-3, help="learning rate")
 
 def parse_args(*args, **kwargs):
@@ -53,9 +52,9 @@ def parse_args(*args, **kwargs):
 def main(args):
     print(args)
 
-    target_img = jnp.array(plt.imread(args.img_file)/255.)
+    target_img = jnp.array(plt.imread(args.img_file)[:, :, :3])
 
-    cppn = CPPN(args.n_layers, args.d_hidden, nonlins=args.nonlins)
+    cppn = CPPN(args.n_layers, args.arch)
     cppn = FlattenCPPNParameters(cppn)
 
     rng = jax.random.PRNGKey(args.seed)
@@ -68,6 +67,7 @@ def main(args):
     @jax.jit
     def train_step(state, _):
         loss, grad = jax.value_and_grad(loss_fn)(state.params, target_img)
+        grad = grad / jnp.linalg.norm(grad)
         state = state.apply_gradients(grads=grad)
         return state, loss
 
@@ -82,6 +82,8 @@ def main(args):
         img = gen_img_fn(state.params)
         losses.append(loss)
         imgs_train.append(img)
+
+        pbar.set_postfix(loss=loss.mean().item())
     losses = np.array(jnp.concatenate(losses))
     imgs_train = np.array(jnp.stack(imgs_train))
     params = state.params
