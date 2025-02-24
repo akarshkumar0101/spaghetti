@@ -1,3 +1,5 @@
+import numpy as np
+
 import jax
 import jax.numpy as jnp
 from einops import rearrange
@@ -8,16 +10,29 @@ def viz_feature_maps(features):
     n_layers = len(features)
     n_layers, max_features_per_layer
 
+    all_maps = []
+
     plt.figure(figsize=(1*max_features_per_layer, 1*n_layers))
     for i, layer_features in enumerate(features):
         for j, fmap in enumerate(rearrange(layer_features, 'h w c -> c h w')):
+
+            is_novel = not any([np.isclose(fmap, fmap2, atol=1e-2).all() for fmap2 in all_maps])
+            # if np.isclose(fmap, np.zeros_like(fmap), atol=1e-2).all() or np.isclose(fmap, np.ones_like(fmap), atol=1e-2).all():
+                # is_novel = False
+            all_maps.append(fmap)
+
             plt.subplot(n_layers, max_features_per_layer, i*max_features_per_layer + j + 1)
             plt.imshow(fmap, cmap='bwr_r', vmin=-1.0, vmax=1.0); plt.xticks([]); plt.yticks([])
             if j==0:
                 plt.ylabel(f"{i}", fontsize=25)
             for spine in plt.gca().spines.values():
                 spine.set_edgecolor('black')
-                spine.set_linewidth(1)
+                spine.set_linewidth(.2)
+            if is_novel:
+                for spine in plt.gca().spines.values():
+                    spine.set_edgecolor('green')
+                    spine.set_linewidth(7)
+
     # plt.subplot(n_layers, max_features_per_layer, (n_layers-1)*max_features_per_layer + (max_features_per_layer-1) + 1)
     # plt.imshow(rgb); plt.axis('off')
     plt.gcf().supylabel("Layer", fontsize=35, x=-0.01)
