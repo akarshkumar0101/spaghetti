@@ -1,106 +1,148 @@
 from functools import partial
+import numpy as np
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
+from jax.random import split
+import flax
+import flax.linen as nn
 
-class CPPN(nn.Module):
-    n_layers: int
-    d_hidden: int
-    nonlin: str = 'tanh' # use tanh or relu
-    residual: bool = False
-    layernorm: bool = False
-
-    @nn.compact
-    def __call__(self, x):
-        intermediate_features = [x]
-        for i_layer in range(self.n_layers):
-            xp = nn.Dense(self.d_hidden)(x)
-            xp = getattr(nn, self.nonlin)(xp)
-            if self.layernorm:
-                xp = nn.LayerNorm()(xp)
-            x = (x + xp) if (self.residual and i_layer>0) else xp
-            intermediate_features.append(x)
-        x = nn.Dense(3)(x)
-        intermediate_features.append(x)
-        rgb = jax.nn.sigmoid(x)
-        return rgb, intermediate_features
-
-    def generate_image(self, params, img_size=128, intermediate_features=False):
-        x = y = jnp.linspace(-1, 1, img_size)
-        x, y = jnp.meshgrid(x, y, indexing='ij')
-        d = jnp.sqrt(x**2 + y**2)
-        xyd = jnp.stack([x, y, d], axis=-1)
-        rgb, features = jax.vmap(jax.vmap(partial(self.apply, params)))(xyd)
-        if intermediate_features:
-            return rgb, features
-        else:
-            return rgb
-
-def hsv2rgb(hsv):
-    h, s, v = hsv
-    h = h * 360.
-
-    c = v * s
-    x = c * (1 - jnp.abs((h / 60) % 2 - 1))
-    m = v - c
-    rgbp1, c1 = jnp.stack([c, x, 0], axis=-1), (0 <= h)*(h<60)
-    rgbp2, c2 = jnp.stack([x, c, 0], axis=-1), (60 <= h)*(h<120)
-    rgbp3, c3 = jnp.stack([0, c, x], axis=-1), (120 <= h)*(h<180)
-    rgbp4, c4 = jnp.stack([0, x, c], axis=-1), (180 <= h)*(h<240)
-    rgbp5, c5 = jnp.stack([x, 0, c], axis=-1), (240 <= h)*(h<300)
-    rgbp6, c6 = jnp.stack([c, 0, x], axis=-1), (300 <= h)*(h<360)
-    rgbp = rgbp1 * c1 + rgbp2 * c2 + rgbp3 * c3 + rgbp4 * c4 + rgbp5 * c5 + rgbp6 * c6
-    rgb = rgbp + m
-    return rgb.clip(0., 1.)
-
-class CPPN(nn.Module):
-    n_layers: int
-    d_hidden: int
-    nonlin: str = 'tanh' # use tanh or relu
-    hsv: bool = False
-
-    @nn.compact
-    def __call__(self, x):
-        intermediate_features = [x]
-        for i_layer in range(self.n_layers):
-            x = nn.Dense(self.d_hidden)(x)
-            x = getattr(nn, self.nonlin)(x)
-            intermediate_features.append(x)
-        x = nn.Dense(3)(x)
-        intermediate_features.append(x)
-        rgb = jax.nn.sigmoid(x)
-        return rgb, intermediate_features
-
-    def generate_image(self, params, img_size=128, intermediate_features=False):
-        x = y = jnp.linspace(-1, 1, img_size)
-        x, y = jnp.meshgrid(x, y, indexing='ij')
-        d = jnp.sqrt(x**2 + y**2)
-        xyd = jnp.stack([x, y, d], axis=-1)
-        rgb, features = jax.vmap(jax.vmap(partial(self.apply, params)))(xyd)
-
-        if self.hsv:
-            rgb = jax.vmap(jax.vmap(hsv2rgb))(rgb)
-        if intermediate_features:
-            return rgb, features
-        else:
-            return rgb
-
+from einops import rearrange
 
 import evosax
+
+from color import hsv2rgb
+
+cache = lambda x: x
+identity = lambda x: x
+cos = jnp.cos
+sin = jnp.sin
+tanh = jnp.tanh
+sigmoid = lambda x: jax.nn.sigmoid(x) * 2. - 1.
+gaussian = lambda x: jnp.exp(-x**2) * 2. - 1.
+relu = jax.nn.relu
+activation_fn_map = dict(cache=cache, identity=identity, cos=cos, sin=sin, tanh=tanh, sigmoid=sigmoid, gaussian=gaussian, relu=relu)
+
+# class CPPN(nn.Module):
+#     n_layers: int
+#     # d_hidden: int
+#     # nonlins: str = "relu" # "sin,tanh,sigmoid,gaussian,relu"
+#     inputs: str = "x,y,d,b" # "x,y,d,b,xabs,yabs"
+#     activation_neurons: str = "identity:20,identity:4,sin:1,cos:0,gaussian:4,sigmoid:0"
+
+#     @nn.compact
+#     def __call__(self, x):
+#         nonlins = self.nonlins.split(",")
+#         features = [x]
+#         for i_layer in range(self.n_layers):
+#             x = nn.Dense(self.d_hidden, use_bias=False)(x)
+
+#             x = rearrange(x, "(n k) -> n k", n=len(nonlins))
+#             x = [activation_fn_map[nonlins[i]](x[i]) for i in range(len(nonlins))]
+#             x = rearrange(x, "n k -> (n k)")
+#             # x = jax.nn.relu(x)
+
+#             features.append(x)
+#         x = nn.Dense(3, use_bias=False)(x)
+#         features.append(x)
+#         h, s, v = jax.nn.tanh(x) # CHANGED THIS TO TANH
+#         return (h, s, v), features
+
+#     def generate_image(self, params, img_size=256, return_features=False):
+#         inputs = {}
+#         x = y = jnp.linspace(-1, 1, img_size)
+#         inputs['x'], inputs['y'] = jnp.meshgrid(x, y, indexing='ij')
+#         inputs['d'] = jnp.sqrt(inputs['x']**2 + inputs['y']**2) * 1.4
+#         inputs['b'] = jnp.ones_like(inputs['x'])
+#         inputs['xabs'], inputs['yabs'] = jnp.abs(inputs['x']), jnp.abs(inputs['y'])
+#         inputs = [inputs[input_name] for input_name in self.inputs.split(",")]
+#         inputs = jnp.stack(inputs, axis=-1)
+#         (h, s, v), features = jax.vmap(jax.vmap(partial(self.apply, params)))(inputs)
+#         r, g, b = hsv2rgb((h+1)%1, s.clip(0,1), jnp.abs(v).clip(0, 1))
+#         rgb = jnp.stack([r, g, b], axis=-1)
+#         if return_features:
+#             return rgb, features
+#         else:
+#             return rgb
+
+# class FlattenCPPNParameters():
+#     def __init__(self, cppn):
+#         self.cppn = cppn
+
+#         rng = jax.random.PRNGKey(0)
+#         d_in = len(self.cppn.inputs.split(","))
+#         self.param_reshaper = evosax.ParameterReshaper(self.cppn.init(rng, jnp.zeros((d_in,))))
+#         self.n_params = self.param_reshaper.total_params
+    
+#     def init(self, rng):
+#         d_in = len(self.cppn.inputs.split(","))
+#         params = self.cppn.init(rng, jnp.zeros((d_in,)))
+#         return self.param_reshaper.flatten_single(params)
+
+#     def generate_image(self, params, img_size=256, return_features=False):
+#         params = self.param_reshaper.reshape_single(params)
+#         return self.cppn.generate_image(params, img_size=img_size, return_features=return_features)
+
+
+class CPPN(nn.Module):
+    n_layers: int
+    # d_hidden: int
+    # nonlins: str = "relu" # "sin,tanh,sigmoid,gaussian,relu"
+    activation_neurons: str = "relu:20"
+    inputs: str = "y,x,d,b" # "x,y,d,b,xabs,yabs"
+
+    @nn.compact
+    def __call__(self, x):
+        activations = [i.split(":")[0] for i in self.activation_neurons.split(",")]
+        d_hidden = [int(i.split(":")[-1]) for i in self.activation_neurons.split(",")]
+        dh_cumsum = list(np.cumsum(d_hidden))
+
+        features = [x]
+        for i_layer in range(self.n_layers):
+            x = nn.Dense(sum(d_hidden), use_bias=False)(x)
+
+            x = jnp.split(x, dh_cumsum)
+            x = [activation_fn_map[activation](xi) for xi, activation in zip(x, activations)]
+            x = jnp.concatenate(x)
+
+            features.append(x)
+        x = nn.Dense(3, use_bias=False)(x)
+        features.append(x)
+        # h, s, v = jax.nn.tanh(x) # CHANGED THIS TO TANH
+        h, s, v = x
+        return (h, s, v), features
+
+    def generate_image(self, params, img_size=256, return_features=False):
+        inputs = {}
+        x = y = jnp.linspace(-1, 1, img_size)
+        inputs['x'], inputs['y'] = jnp.meshgrid(x, y, indexing='ij')
+        inputs['d'] = jnp.sqrt(inputs['x']**2 + inputs['y']**2) * 1.4
+        inputs['b'] = jnp.ones_like(inputs['x'])
+        inputs['xabs'], inputs['yabs'] = jnp.abs(inputs['x']), jnp.abs(inputs['y'])
+        inputs = [inputs[input_name] for input_name in self.inputs.split(",")]
+        inputs = jnp.stack(inputs, axis=-1)
+        (h, s, v), features = jax.vmap(jax.vmap(partial(self.apply, params)))(inputs)
+        r, g, b = hsv2rgb((h+1)%1, s.clip(0,1), jnp.abs(v).clip(0, 1))
+        rgb = jnp.stack([r, g, b], axis=-1)
+        if return_features:
+            return rgb, features
+        else:
+            return rgb
+
 class FlattenCPPNParameters():
     def __init__(self, cppn):
         self.cppn = cppn
 
         rng = jax.random.PRNGKey(0)
-        self.param_reshaper = evosax.ParameterReshaper(self.cppn.init(rng, jnp.zeros((3,))))
+        d_in = len(self.cppn.inputs.split(","))
+        self.param_reshaper = evosax.ParameterReshaper(self.cppn.init(rng, jnp.zeros((d_in,))))
         self.n_params = self.param_reshaper.total_params
     
-    def init(self, rng, x):
-        params = self.cppn.init(rng, x)
+    def init(self, rng):
+        d_in = len(self.cppn.inputs.split(","))
+        params = self.cppn.init(rng, jnp.zeros((d_in,)))
         return self.param_reshaper.flatten_single(params)
 
-    def generate_image(self, params, img_size=128, intermediate_features=False):
+    def generate_image(self, params, img_size=256, return_features=False):
         params = self.param_reshaper.reshape_single(params)
-        return self.cppn.generate_image(params, img_size=img_size, intermediate_features=intermediate_features)
-    
+        return self.cppn.generate_image(params, img_size=img_size, return_features=return_features)
