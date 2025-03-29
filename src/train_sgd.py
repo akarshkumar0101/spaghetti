@@ -29,14 +29,12 @@ import util
 parser = argparse.ArgumentParser()
 group = parser.add_argument_group("meta")
 group.add_argument("--seed", type=int, default=0, help="the random seed")
-
-group = parser.add_argument_group("data")
-group.add_argument("--img_file", type=str, default="../skull.jpg", help="path of image file")
 group.add_argument("--save_dir", type=str, default=None, help="path to save results to")
 
-group = parser.add_argument_group("data")
-group.add_argument("--n_layers", type=int, default=12, help="number of layers")
+group = parser.add_argument_group("model")
 group.add_argument("--arch", type=str, default="", help="architecture")
+group = parser.add_argument_group("data")
+group.add_argument("--img_file", type=str, default=None, help="path of image file")
 
 group = parser.add_argument_group("optimization")
 group.add_argument("--n_iters", type=int, default=100000, help="number of iterations")
@@ -54,8 +52,7 @@ def main(args):
 
     target_img = jnp.array(plt.imread(args.img_file)[:, :, :3])
 
-    cppn = CPPN(args.n_layers, args.arch)
-    cppn = FlattenCPPNParameters(cppn)
+    cppn = FlattenCPPNParameters(CPPN(args.arch))
 
     rng = jax.random.PRNGKey(args.seed)
     params = cppn.init(rng)
@@ -77,22 +74,31 @@ def main(args):
     gen_img_fn = jax.jit(partial(cppn.generate_image, img_size=256))
     losses, imgs_train = [], [gen_img_fn(state.params)]
     pbar = tqdm(range(args.n_iters//100))
+    # pbar = tqdm(range(args.n_iters//1))
     for i_iter in pbar:
         state, loss = jax.lax.scan(train_step, state, None, length=100)
-        img = gen_img_fn(state.params)
+        # state, loss = jax.lax.scan(train_step, state, None, length=1)
+        print(loss)
         losses.append(loss)
-        imgs_train.append(img)
 
         pbar.set_postfix(loss=loss.mean().item())
+        if i_iter < 100:
+            img = gen_img_fn(state.params)
+            imgs_train.append(img)
+
     losses = np.array(jnp.concatenate(losses))
     imgs_train = np.array(jnp.stack(imgs_train))
     params = state.params
+    img = gen_img_fn(params)
 
     if args.save_dir is not None:
         os.makedirs(args.save_dir, exist_ok=True)
+        plt.imsave(f"{args.save_dir}/img.png", np.array(img))
+        util.save_pkl(args.save_dir, "arch", args.arch)
+        util.save_pkl(args.save_dir, "params", params)
+
         util.save_pkl(args.save_dir, "losses", losses)
         util.save_pkl(args.save_dir, "imgs_train", imgs_train)
-        util.save_pkl(args.save_dir, "params", params)
 
 if __name__ == '__main__':
     main(parse_args())

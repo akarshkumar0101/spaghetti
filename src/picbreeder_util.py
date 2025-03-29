@@ -33,7 +33,7 @@ def load_zip_xml_as_dict(zip_file_path):
         root = dict(genome=root)
     return root
 
-def get_parent_pid(pb_dir, pid):
+def get_pid_parent(pb_dir, pid):
     zip_file_path = f"{pb_dir}/{pid}/main.zip"
     root = load_zip_xml_as_dict(zip_file_path)
 
@@ -42,3 +42,22 @@ def get_parent_pid(pb_dir, pid):
     except KeyError:
         parent_pid = None
     return parent_pid
+
+def get_pid_lineage(pb_dir, pid):
+    lineage_pids = []
+    while pid is not None:
+        lineage_pids.append(pid)
+        try:
+            pid = get_pid_parent(pb_dir, pid)
+        except Exception:
+            break
+    lineage_pids = lineage_pids[::-1]
+    return lineage_pids
+
+def get_pid_age(pb_dir, pid):
+    zip_file_path = f"{pb_dir}/{pid}/rep.zip"
+    root = load_zip_xml_as_dict(zip_file_path)
+    age = int(root['genome']['@age'])
+    return age
+    
+

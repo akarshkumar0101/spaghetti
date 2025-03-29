@@ -85,21 +85,26 @@ activation_fn_map = dict(cache=cache, identity=identity, cos=cos, sin=sin, tanh=
 
 
 class CPPN(nn.Module):
-    n_layers: int
-    # d_hidden: int
-    # nonlins: str = "relu" # "sin,tanh,sigmoid,gaussian,relu"
-    activation_neurons: str = "relu:20"
+    arch: str = "12;cache:15,gaussian:4,identity:2,sin:1" # means 12 layers, 15 neurons with cache, 4 neurons with gaussian, 2 neurons with identity, 1 neuron with sin
+    # n_layers: int
+    # # d_hidden: int
+    # # nonlins: str = "relu" # "sin,tanh,sigmoid,gaussian,relu"
+    # activation_neurons: str = "relu:20"
     inputs: str = "y,x,d,b" # "x,y,d,b,xabs,yabs"
 
     @nn.compact
     def __call__(self, x):
-        activations = [i.split(":")[0] for i in self.activation_neurons.split(",")]
-        d_hidden = [int(i.split(":")[-1]) for i in self.activation_neurons.split(",")]
+        n_layers, activation_neurons = self.arch.split(";")
+        n_layers = int(n_layers)
+
+        activations = [i.split(":")[0] for i in activation_neurons.split(",")]
+        d_hidden = [int(i.split(":")[-1]) for i in activation_neurons.split(",")]
         dh_cumsum = list(np.cumsum(d_hidden))
 
         features = [x]
-        for i_layer in range(self.n_layers):
+        for i_layer in range(n_layers):
             x = nn.Dense(sum(d_hidden), use_bias=False)(x)
+            # x = nn.Dense(sum(d_hidden), use_bias=False, kernel_init=nn.initializers.kaiming_normal())(x)
 
             x = jnp.split(x, dh_cumsum)
             x = [activation_fn_map[activation](xi) for xi, activation in zip(x, activations)]
@@ -122,7 +127,7 @@ class CPPN(nn.Module):
         inputs = [inputs[input_name] for input_name in self.inputs.split(",")]
         inputs = jnp.stack(inputs, axis=-1)
         (h, s, v), features = jax.vmap(jax.vmap(partial(self.apply, params)))(inputs)
-        r, g, b = hsv2rgb((h+1)%1, s.clip(0,1), jnp.abs(v).clip(0, 1))
+        r, g, b = hsv2rgb(h%1, s.clip(0,1), jnp.abs(v).clip(0, 1))
         rgb = jnp.stack([r, g, b], axis=-1)
         if return_features:
             return rgb, features

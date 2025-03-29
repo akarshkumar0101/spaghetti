@@ -20,34 +20,11 @@ import matplotlib.pyplot as plt
 from color import hsv2rgb
 from cppn import CPPN, FlattenCPPNParameters, activation_fn_map
 import util
-
-def xml_to_dict(element):
-    node = {}
-    if element.attrib:
-        node.update({f"@{key}": value for key, value in element.attrib.items()})
-    children = list(element)
-    if children:
-        child_dict = {}
-        for child in children:
-            child_name = child.tag
-            child_dict.setdefault(child_name, []).append(xml_to_dict(child))
-        for key, value in child_dict.items():
-            node[key] = value if len(value) > 1 else value[0]
-    else:
-        if element.text and element.text.strip():
-            node["#text"] = element.text.strip()
-    return node
+import picbreeder_util
 
 def load_pbcppn(zip_file_path):
-    with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
-        file_list = zip_ref.namelist()
-        assert len(file_list) == 1
-        for file_name in file_list:
-            with zip_ref.open(file_name) as file:
-                file_content = file.read().decode('utf-8')
-    root = xml_to_dict(ET.fromstring(file_content))
-    if 'genome' not in root:
-        root = dict(genome=root)
+    root = picbreeder_util.load_zip_xml_as_dict(zip_file_path)
+
     ns, ls = [], []
     nodes_ = root['genome']['nodes']['node']
     links_ = root['genome']['links']['link']
@@ -121,11 +98,57 @@ def do_forward_pass(nn):
         get_value_recur(node, path=[])
     
     h, s, v = node2val[node_h], node2val[node_s], node2val[node_v]
-    r, g, b = hsv2rgb((h+1)%1, s.clip(0,1), jnp.abs(v).clip(0, 1))
+    r, g, b = hsv2rgb(h%1, s.clip(0,1), jnp.abs(v).clip(0, 1))
     rgb = jnp.stack([r, g, b], axis=-1)
     return dict(rgb=rgb, node2val=node2val)
 
+def get_weight_matrix(net, i_layer, nodes_cache, activation_neurons=""):
+    node2activation = {n['id']: n['activation'] for n in net['nodes']}
+
+    activations = [i.split(":")[0] for i in activation_neurons.split(",")]
+    d_hidden = np.array([int(i.split(":")[-1]) for i in activation_neurons.split(",")])
+
+    position_offset = {act: p for act, p in zip(activations, np.cumsum(np.array([0]+list(d_hidden)[:-1])))}
+
+    def get_position_within_layer(nodes_caches_layer, node): # node_id
+        i_node = [n for n, _ in nodes_caches_layer].index(node)
+
+        node, act = nodes_caches_layer[i_node]
+        p = 0
+        for n, a in nodes_caches_layer:
+            if n==node:
+                break
+            elif a==act:
+                p+=1
+        p = p + position_offset[act]
+        return p
+
+    prev_layer = nodes_cache[i_layer]
+    this_layer = nodes_cache[i_layer+1]
+    prev_layer = [(a, 'cache' if not b else node2activation[a]) for a, b in prev_layer]
+    this_layer = [(a, 'cache' if not b else node2activation[a]) for a, b in this_layer]
+
+    if i_layer==0:
+        prev_layer = [(a, 'cache') for a, _ in prev_layer]
+
+    weight_mat = np.zeros((sum(d_hidden), sum(d_hidden)))
+    for n, act in this_layer:
+        p = get_position_within_layer(this_layer, n)
+        if act=='cache':
+            p2 = get_position_within_layer(prev_layer, n)
+            # print(n, act, p, p2)
+            weight_mat[p, p2] = 1.
+        else:
+            for src, w in [(l['source'], l['weight']) for l in net['links'] if l['target']==n]:
+                p2 = get_position_within_layer(prev_layer, src)
+                weight_mat[p, p2] = w
+    return weight_mat.T
+
+
 def layerize_nn(nn):
+    """
+    Converts the picbreeder graph to a dense network by layerizing the connections which connect a few layers back.
+    """
     node2activation = {n['id']: n['activation'] for n in nn['nodes']}
     node2out_links = {n['id']: [(l['target'], l['weight']) for l in nn['links'] if l['source'] == n['id']] for n in nn['nodes']}
     node2in_links = {n['id']: [(l['source'], l['weight']) for l in nn['links'] if l['target'] == n['id']] for n in nn['nodes']}
@@ -174,16 +197,16 @@ def layerize_nn(nn):
         a = defaultdict(int)
         for node, novel in nodes_layer:
             a[node2activation[node] if novel else "cache"] += 1
-        print(dict(a))
+        # print(dict(a))
         for k in a:
             arch[k] = max(arch[k], a[k])
     arch = dict(sorted(dict(arch).items()))
     width = sum(arch.values())
-    print("n_nodes=", len(node2val))
-    print(arch)
-    print("n_layers=", n_layers)
-    print("width=", width)
-    print("parameters=", width*width*n_layers)
+    # print("n_nodes=", len(node2val))
+    # print(arch)
+    # print("n_layers=", n_layers)
+    # print("width=", width)
+    # print("parameters=", width*width*n_layers)
     features = [jnp.stack([node2val[node] for node, _ in nodes_cache[i]], axis=-1) for i in range(n_layers)]
     def get_novelty(node, nodes_cache_layer):
         a = [novelty for n, novelty in nodes_cache_layer if n==node]
@@ -193,73 +216,25 @@ def layerize_nn(nn):
     # nodes_cache[-1] = [(node, get_novelty(node, nodes_cache[-1])) for node in [node_h, node_s, node_v]]
     nodes_cache.append([(n, False) for n in [node_h, node_s, node_v]])
 
-    arch = ','.join([f"{k}:{v}" for k, v in arch.items()])
-    outputs = dict(rgb=rgb, node2val=node2val, arch=arch, node2layer=node2layer, features=features, nodes_cache=nodes_cache)
-    # raise ValueError
-    return outputs
+    n_layers = len(nodes_cache)-2
+    arch = f'{n_layers};' + ','.join([f"{k}:{v}" for k, v in arch.items()])
 
-def get_weight_matrix(net, i_layer, nodes_cache, activation_neurons=""):
-    node2activation = {n['id']: n['activation'] for n in net['nodes']}
 
-    activations = [i.split(":")[0] for i in activation_neurons.split(",")]
-    d_hidden = np.array([int(i.split(":")[-1]) for i in activation_neurons.split(",")])
-
-    position_offset = {act: p for act, p in zip(activations, np.cumsum(np.array([0]+list(d_hidden)[:-1])))}
-
-    def get_position_within_layer(nodes_caches_layer, node): # node_id
-        i_node = [n for n, _ in nodes_caches_layer].index(node)
-
-        node, act = nodes_caches_layer[i_node]
-        p = 0
-        for n, a in nodes_caches_layer:
-            if n==node:
-                break
-            elif a==act:
-                p+=1
-        p = p + position_offset[act]
-        return p
-
-    prev_layer = nodes_cache[i_layer]
-    this_layer = nodes_cache[i_layer+1]
-    prev_layer = [(a, 'cache' if not b else node2activation[a]) for a, b in prev_layer]
-    this_layer = [(a, 'cache' if not b else node2activation[a]) for a, b in this_layer]
-
-    if i_layer==0:
-        prev_layer = [(a, 'cache') for a, _ in prev_layer]
-
-    weight_mat = np.zeros((sum(d_hidden), sum(d_hidden)))
-    for n, act in this_layer:
-        p = get_position_within_layer(this_layer, n)
-        if act=='cache':
-            p2 = get_position_within_layer(prev_layer, n)
-            # print(n, act, p, p2)
-            weight_mat[p, p2] = 1.
-        else:
-            for src, w in [(l['source'], l['weight']) for l in net['links'] if l['target']==n]:
-                p2 = get_position_within_layer(prev_layer, src)
-                weight_mat[p, p2] = w
-    return weight_mat.T
-
-def construct_dense_cppn(pbcppn, nodes_cache, activation_neurons=""):
-    n_layers = len(nodes_cache)-1
-    cppn = CPPN(n_layers-1, activation_neurons)
+    pbcppn = nn
+    activation_neurons = arch.split(";")[1]
+    cppn = CPPN(arch)
     cppn = FlattenCPPNParameters(cppn)
     params = jnp.zeros(cppn.n_params)
     params = cppn.param_reshaper.reshape_single(params)
-
-    weight_mats = np.stack([get_weight_matrix(pbcppn, i_layer, nodes_cache, activation_neurons=activation_neurons) for i_layer in range(n_layers)])
-
-    for i_layer in range(n_layers):
+    weight_mats = np.stack([get_weight_matrix(pbcppn, i_layer, nodes_cache, activation_neurons=activation_neurons) for i_layer in range(n_layers+1)])
+    for i_layer in range(n_layers+1):
         a, b = params['params'][f'Dense_{i_layer}']['kernel'].shape
         w = weight_mats[i_layer][:a, :b]
         params['params'][f'Dense_{i_layer}']['kernel'] = jnp.array(w)[:a, :b]
-
     # a, b = params['params'][f'Dense_{n_layers-1}']['kernel'].shape
     # params['params'][f'Dense_{n_layers-1}']['kernel'] = jnp.eye(a, b)
-
     params = cppn.param_reshaper.flatten_single(params)
-    return cppn, params
-
+    return dict(rgb=rgb, node2val=node2val, node2layer=node2layer, features=features, nodes_cache=nodes_cache, arch=arch, cppn=cppn, params=params)
 
 parser = argparse.ArgumentParser()
 group = parser.add_argument_group("meta")
@@ -268,15 +243,6 @@ group = parser.add_argument_group("meta")
 group = parser.add_argument_group("data")
 group.add_argument("--zip_path", type=str, default=None, help="path to rep.zip")
 group.add_argument("--save_dir", type=str, default=None, help="path to save results to")
-
-# group = parser.add_argument_group("data")
-# group.add_argument("--n_layers", type=int, default=10, help="number of layers")
-# group.add_argument("--d_hidden", type=int, default=25, help="number of hidden units")
-# group.add_argument("--nonlins", type=str, default="identity,sin,cos,gaussian,sigmoid", help="nonlinearity to use")
-
-# group = parser.add_argument_group("optimization")
-# group.add_argument("--n_iters", type=int, default=50000, help="number of iterations")
-# group.add_argument("--lr", type=float, default=3e-3, help="learning rate")
 
 def parse_args(*args, **kwargs):
     args = parser.parse_args(*args, **kwargs)
@@ -287,25 +253,16 @@ def parse_args(*args, **kwargs):
 
 def main(args):
     pbcppn = load_pbcppn(args.zip_path)
-    # outputs = do_forward_pass(pbcppn)
-    outputs = layerize_nn(pbcppn)
-    print(outputs.keys())
-    cppn, params = construct_dense_cppn(pbcppn, outputs['nodes_cache'], activation_neurons=outputs['arch'])
-    print(outputs['arch'])
+    layerize_outputs = layerize_nn(pbcppn)
+    arch, params = layerize_outputs['arch'], layerize_outputs['params']
+    cppn = FlattenCPPNParameters(CPPN(arch))
     img, features = cppn.generate_image(params, return_features=True, img_size=256)
     if args.save_dir is not None:
         os.makedirs(args.save_dir, exist_ok=True)
-        plt.imsave(f"{args.save_dir}/img.png", np.array(outputs['rgb']))
+        plt.imsave(f"{args.save_dir}/img.png", np.array(img))
         util.save_pkl(args.save_dir, "pbcppn", pbcppn)
-        util.save_pkl(args.save_dir, "outputs", outputs)
+        util.save_pkl(args.save_dir, "arch", arch)
         util.save_pkl(args.save_dir, "params", params)
-        cppn_args = (len(outputs['nodes_cache'])-2, outputs['arch'])
-        util.save_pkl(args.save_dir, "cppn_args", cppn_args)
 
 if __name__=="__main__":
     main(parse_args())
-
-"""
-python process_pb.py --pbid=576 --save_dir="../genome_skull"
-python process_pb.py --pbid=5736 --save_dir="../genome_apple"
-"""
