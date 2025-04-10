@@ -1,6 +1,9 @@
 import jax.numpy as jnp
 
 def hsv2rgb(h, s, v):
+    """
+    Everything should be in the range [0, 1].
+    """
     h = h * 360.
 
     c = v * s

@@ -98,7 +98,7 @@ def do_forward_pass(nn):
         get_value_recur(node, path=[])
     
     h, s, v = node2val[node_h], node2val[node_s], node2val[node_v]
-    r, g, b = hsv2rgb(h%1, s.clip(0,1), jnp.abs(v).clip(0, 1))
+    r, g, b = hsv2rgb((h+1)%1, s.clip(0,1), jnp.abs(v).clip(0, 1))
     rgb = jnp.stack([r, g, b], axis=-1)
     return dict(rgb=rgb, node2val=node2val)
 
